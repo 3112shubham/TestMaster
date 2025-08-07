@@ -1,1 +1,13 @@
 @import "tailwindcss";
+/* Add this to your global CSS file */
+video {
+  background-color: transparent;
+  display: block;
+  object-fit: cover;
+}
+
+/* Fix for Safari fullscreen */
+:-webkit-full-screen video {
+  width: 100% !important;
+  height: 100% !important;
+}
