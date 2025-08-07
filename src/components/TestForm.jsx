@@ -27,30 +27,48 @@ export default function TestForm() {
   const videoRef = useRef(null);
   const mediaStreamRef = useRef(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  
-  // Fullscreen exit detection
-  const [fullscreenExitCount, setFullscreenExitCount] = useState(0);
-  const fullscreenExitWarningRef = useRef(null);
+  const fullscreenExitCountRef = useRef(0);
   const [showFullscreenWarning, setShowFullscreenWarning] = useState(false);
   const [cameraDisconnected, setCameraDisconnected] = useState(false);
+  const [streamActive, setStreamActive] = useState(false);
+  const checkStreamIntervalRef = useRef(null);
 
-  // Check media stream status periodically
+  // Enhanced camera monitoring
+  const monitorStream = useCallback(() => {
+    if (!mediaStreamRef.current) return;
+
+    const videoTracks = mediaStreamRef.current.getVideoTracks();
+    if (videoTracks.length === 0) {
+      setCameraDisconnected(true);
+      setStreamActive(false);
+      return;
+    }
+
+    const isActive = videoTracks[0].readyState === 'live';
+    setStreamActive(isActive);
+    setCameraDisconnected(!isActive);
+
+    if (!isActive) {
+      toast.error("Camera disconnected! Please check your camera connection.", {
+        autoClose: false,
+        toastId: 'camera-error'
+      });
+    } else {
+      toast.dismiss('camera-error');
+    }
+  }, []);
+
+  // Start/stop stream monitoring
   useEffect(() => {
-    if (!submitted || !mediaStreamRef.current) return;
-
-    const checkStream = () => {
-      const isActive = mediaStreamRef.current?.active;
-      if (!isActive && hasMediaPermissions) {
-        setCameraDisconnected(true);
-        toast.error("Camera feed disconnected! Please check your camera connection.");
-      } else if (isActive && cameraDisconnected) {
-        setCameraDisconnected(false);
-      }
-    };
-
-    const interval = setInterval(checkStream, 5000);
-    return () => clearInterval(interval);
-  }, [submitted, hasMediaPermissions, cameraDisconnected]);
+    if (submitted && hasMediaPermissions) {
+      checkStreamIntervalRef.current = setInterval(monitorStream, 3000);
+      monitorStream(); // Initial check
+      return () => {
+        clearInterval(checkStreamIntervalRef.current);
+        toast.dismiss('camera-error');
+      };
+    }
+  }, [submitted, hasMediaPermissions, monitorStream]);
 
   // Load test data
   useEffect(() => {
@@ -60,7 +78,7 @@ export default function TestForm() {
         if (testDoc.exists()) {
           const testData = testDoc.data();
           setTest(testData);
-          setTimeLeft(testData.duration * 60); // Convert minutes to seconds
+          setTimeLeft(testData.duration * 60);
           
           // Initialize answers
           setAnswers(testData.questions.map(question => 
@@ -100,7 +118,7 @@ export default function TestForm() {
     return () => clearInterval(timer);
   }, [timeLeft, submitted]);
 
-  // Request media permissions
+  // Request media permissions with enhanced error handling
   const requestMediaPermissions = useCallback(async () => {
     try {
       setMediaError(null);
@@ -123,105 +141,112 @@ export default function TestForm() {
         throw new Error("No video track available");
       }
 
-      await new Promise((resolve) => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          mediaStreamRef.current = stream;
-          
+      mediaStreamRef.current = stream;
+      setStreamActive(true);
+      
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await new Promise((resolve) => {
           videoRef.current.onloadedmetadata = () => {
             videoRef.current.play()
               .then(resolve)
               .catch(e => {
-                console.error("Video play failed:", e);
-                videoRef.current.play().catch(console.error);
+                console.warn("Video play warning:", e);
                 resolve();
               });
           };
-        } else {
-          resolve();
-        }
-      });
+        });
+      }
 
       setHasMediaPermissions(true);
-      
-      try {
-        if (document.documentElement.requestFullscreen) {
-          await document.documentElement.requestFullscreen();
-          setIsFullscreen(true);
-        }
-      } catch (fsError) {
-        console.warn("Fullscreen error:", fsError);
-      }
+      await enterFullscreen();
       
     } catch (error) {
       console.error("Media error:", error);
       setMediaError(error.message);
-      toast.error(`Camera access error: ${error.message}`);
+      toast.error(`Proctoring error: ${error.message}`);
       setHasMediaPermissions(false);
+      
+      // Still allow test to proceed but mark as no permissions
       setSubmitted(true);
     }
   }, []);
 
-  // Clean up media streams on unmount
+  // Enhanced fullscreen handling
+  const enterFullscreen = useCallback(async () => {
+    try {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+        setIsFullscreen(true);
+      }
+    } catch (error) {
+      console.warn("Fullscreen error:", error);
+      toast.warn("Could not enter fullscreen automatically. Please press F11 to enter fullscreen.");
+    }
+  }, []);
+
+  // Clean up resources
   useEffect(() => {
     return () => {
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach(track => track.stop());
       }
-      
       if (document.fullscreenElement) {
-        document.exitFullscreen();
+        document.exitFullscreen().catch(console.warn);
       }
+      clearInterval(checkStreamIntervalRef.current);
+      toast.dismiss();
     };
   }, []);
 
-  // Handle fullscreen change events and warnings
+  // Robust fullscreen monitoring
   useEffect(() => {
     if (!submitted) return;
 
     const handleFullscreenChange = () => {
-      const currentlyFullscreen = !!document.fullscreenElement;
-      setIsFullscreen(currentlyFullscreen);
+      const isCurrentlyFullscreen = !!document.fullscreenElement;
+      setIsFullscreen(isCurrentlyFullscreen);
 
-      if (!currentlyFullscreen && submitted) {
+      if (!isCurrentlyFullscreen) {
+        fullscreenExitCountRef.current += 1;
+        const exitCount = fullscreenExitCountRef.current;
+        const remainingWarnings = 3 - exitCount;
+        
         setShowFullscreenWarning(true);
-        setFullscreenExitCount(prev => {
-          const newCount = prev + 1;
-          const remainingWarnings = 3 - newCount;
-          
-          if (newCount <= 3) {
-            toast.warn(
-              `Warning ${newCount}/3: Fullscreen exit detected! ${remainingWarnings > 0 ? 
-              `${remainingWarnings} warning${remainingWarnings > 1 ? 's' : ''} remaining.` : 
-              'Test will be auto-submitted!'}`,
-              { autoClose: false }
-            );
-          }
+        
+        if (exitCount <= 3) {
+          toast.warn(
+            `Warning ${exitCount}/3: Fullscreen exit detected! ${
+              remainingWarnings > 0 
+                ? `${remainingWarnings} more warning${remainingWarnings > 1 ? 's' : ''} before auto-submit.` 
+                : 'Test will be auto-submitted!'
+            }`,
+            { autoClose: false, toastId: 'fullscreen-warning' }
+          );
+        }
 
-          if (newCount >= 3) {
-            handleAutoSubmit();
-            toast.error('Test auto-submitted due to multiple fullscreen exits!');
-          } else {
-            // Re-enter fullscreen after warning
-            setTimeout(() => {
-              if (document.documentElement.requestFullscreen) {
-                document.documentElement.requestFullscreen().catch(console.error);
-              }
-            }, 1000);
-          }
-
-          return newCount;
-        });
+        if (exitCount >= 3) {
+          handleAutoSubmit();
+          toast.error('Test auto-submitted due to multiple fullscreen exits!');
+        } else {
+          // Aggressive fullscreen re-entry
+          setTimeout(() => {
+            if (!document.fullscreenElement) {
+              enterFullscreen().catch(console.warn);
+            }
+          }, 500);
+        }
       } else {
         setShowFullscreenWarning(false);
+        toast.dismiss('fullscreen-warning');
       }
     };
-    
+
     document.addEventListener('fullscreenchange', handleFullscreenChange);
     return () => {
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
     };
-  }, [submitted]);
+  }, [submitted, enterFullscreen]);
 
   const handleAutoSubmit = async () => {
     if (isSubmitting) return;
@@ -289,8 +314,8 @@ export default function TestForm() {
       totalQuestions: test.questions.length,
       timeTaken: test.duration * 60 - timeLeft,
       mediaPermissionsGranted: hasMediaPermissions,
-      fullscreenExitCount,
-      wasAutoSubmitted: fullscreenExitCount >= 3,
+      fullscreenExitCount: fullscreenExitCountRef.current,
+      wasAutoSubmitted: fullscreenExitCountRef.current >= 3,
       cameraDisconnected
     };
 
@@ -320,9 +345,7 @@ export default function TestForm() {
       }
       
       if (question.type === 'multiple') {
-        if (!Array.isArray(userAnswer) || !Array.isArray(question.correctAnswer)) {
-          return score;
-        }
+        if (!Array.isArray(userAnswer)) return score;
         
         const correctSet = new Set(question.correctAnswer);
         const userSet = new Set(userAnswer);
@@ -330,7 +353,7 @@ export default function TestForm() {
         return (
           question.correctAnswer.length === userAnswer.length &&
           question.correctAnswer.every(ans => userSet.has(ans))
-        ) ? score + 1 : score;
+          ? score + 1 : score);
       }
       
       return score;
@@ -436,7 +459,7 @@ export default function TestForm() {
 
   return (
     <div className="relative">
-      {/* Webcam preview */}
+      {/* Webcam preview with enhanced status display */}
       {hasMediaPermissions && (
         <div className="fixed bottom-4 right-4 z-50 w-48 h-36 bg-black rounded-lg overflow-hidden shadow-xl border-2 border-red-500">
           <video
@@ -446,46 +469,37 @@ export default function TestForm() {
             playsInline
             className="w-full h-full object-cover"
             style={{ transform: 'rotateY(180deg)' }}
-            onError={(e) => {
-              console.error("Video error:", e);
-              toast.error("Video feed unavailable");
-            }}
-            onCanPlay={() => {
-              if (videoRef.current && videoRef.current.paused) {
-                videoRef.current.play().catch(console.error);
-              }
-            }}
           />
-          <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white text-xs p-1 text-center">
+          <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-70 text-white text-xs p-1 text-center">
             <div className="flex items-center justify-center">
               <div className={`w-2 h-2 rounded-full mr-2 ${
-                mediaStreamRef.current?.active ? 'bg-green-500' : 'bg-red-500'
+                streamActive ? 'bg-green-500 animate-pulse' : 'bg-red-500'
               }`}></div>
-              {mediaStreamRef.current?.active ? 'Proctoring Active' : 'Camera Disconnected'}
+              {streamActive ? 'Proctoring Active' : 'Camera Disconnected'}
             </div>
           </div>
         </div>
       )}
       
-      {/* Fullscreen warning */}
+      {/* Enhanced fullscreen warning modal */}
       {showFullscreenWarning && (
         <div className="fixed inset-0 bg-black bg-opacity-90 z-50 flex flex-col items-center justify-center text-white p-6">
-          <div className="bg-red-600 text-white p-4 rounded-lg mb-6">
-            <h2 className="text-2xl font-bold mb-2">⚠️ Fullscreen Required</h2>
-            <p>Please switch back to fullscreen mode to continue with your test.</p>
-            {fullscreenExitCount > 0 && (
-              <p className="mt-2">
-                Warnings: {fullscreenExitCount}/3 - {3 - fullscreenExitCount} remaining
-              </p>
-            )}
+          <div className="bg-red-600 text-white p-6 rounded-lg max-w-md text-center">
+            <h2 className="text-2xl font-bold mb-3">⚠️ Fullscreen Required</h2>
+            <p className="mb-4">You must remain in fullscreen mode to continue the test.</p>
+            <p className="font-medium mb-4">
+              Warnings: {fullscreenExitCountRef.current}/3
+            </p>
+            <button
+              onClick={enterFullscreen}
+              className="px-6 py-3 bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors font-medium"
+            >
+              Re-enter Fullscreen Now
+            </button>
+            <p className="mt-4 text-sm text-gray-300">
+              Press F11 if the button doesn't work
+            </p>
           </div>
-          <button
-            onClick={() => document.documentElement.requestFullscreen()}
-            className="px-6 py-3 bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
-          >
-            Enter Fullscreen Now
-          </button>
-          <p className="mt-4 text-gray-300">Press F11 if the button doesn't work</p>
         </div>
       )}
       
@@ -502,9 +516,9 @@ export default function TestForm() {
               <div>
                 <h2 className="text-2xl font-bold">{test.title}</h2>
                 <p className="opacity-90">Time Remaining: {formatTime(timeLeft)}</p>
-                {fullscreenExitCount > 0 && (
+                {fullscreenExitCountRef.current > 0 && (
                   <p className="text-sm mt-1 bg-white/10 px-2 py-1 rounded">
-                    Fullscreen warnings: {fullscreenExitCount}/3
+                    Fullscreen warnings: {fullscreenExitCountRef.current}/3
                   </p>
                 )}
                 {cameraDisconnected && (
