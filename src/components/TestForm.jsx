@@ -32,43 +32,300 @@ export default function TestForm() {
   const [cameraDisconnected, setCameraDisconnected] = useState(false);
   const [streamActive, setStreamActive] = useState(false);
   const checkStreamIntervalRef = useRef(null);
+  const frameMonitorIntervalRef = useRef(null);
+  const fullscreenRetryTimeoutRef = useRef(null);
 
-  // Enhanced camera monitoring
-  const monitorStream = useCallback(() => {
-    if (!mediaStreamRef.current) return;
+  // Enhanced camera initialization with device ID tracking
+  const [currentDeviceId, setCurrentDeviceId] = useState(null);
+  const [availableDevices, setAvailableDevices] = useState([]);
 
-    const videoTracks = mediaStreamRef.current.getVideoTracks();
-    if (videoTracks.length === 0) {
-      setCameraDisconnected(true);
-      setStreamActive(false);
-      return;
-    }
+  // Disable ESC key during test
+  useEffect(() => {
+    if (!submitted) return;
 
-    const isActive = videoTracks[0].readyState === 'live';
-    setStreamActive(isActive);
-    setCameraDisconnected(!isActive);
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        fullscreenExitCountRef.current += 1;
+        const exitCount = fullscreenExitCountRef.current;
+        
+        if (exitCount <= 3) {
+          toast.warn(
+            `Warning ${exitCount}/3: ESC key disabled during test! ${
+              3 - exitCount > 0 
+                ? `${3 - exitCount} more warning${3 - exitCount > 1 ? 's' : ''} before auto-submit.` 
+                : 'Test will be auto-submitted!'
+            }`,
+            { autoClose: false, toastId: 'esc-warning' }
+          );
+        }
 
-    if (!isActive) {
-      toast.error("Camera disconnected! Please check your camera connection.", {
-        autoClose: false,
-        toastId: 'camera-error'
-      });
-    } else {
-      toast.dismiss('camera-error');
+        if (exitCount >= 3) {
+          handleAutoSubmit();
+          toast.error('Test auto-submitted due to multiple ESC key presses!');
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [submitted]);
+
+  // Get available camera devices
+  const getVideoDevices = useCallback(async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(device => device.kind === 'videoinput');
+      setAvailableDevices(videoDevices);
+      return videoDevices;
+    } catch (error) {
+      console.error("Error enumerating devices:", error);
+      return [];
     }
   }, []);
 
-  // Start/stop stream monitoring
-  useEffect(() => {
-    if (submitted && hasMediaPermissions) {
-      checkStreamIntervalRef.current = setInterval(monitorStream, 3000);
-      monitorStream(); // Initial check
-      return () => {
-        clearInterval(checkStreamIntervalRef.current);
-        toast.dismiss('camera-error');
+  // Initialize camera with specific device
+  const initializeCamera = useCallback(async (deviceId = null) => {
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("Camera API not available");
+      }
+
+      const constraints = {
+        audio: true,
+        video: {
+          width: { min: 640, ideal: 1280, max: 1920 },
+          height: { min: 480, ideal: 720, max: 1080 },
+          frameRate: { ideal: 30, min: 15 }
+        }
       };
+
+      if (deviceId) {
+        constraints.video.deviceId = { exact: deviceId };
+      } else {
+        constraints.video.facingMode = 'user';
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const videoTrack = stream.getVideoTracks()[0];
+      
+      if (!videoTrack) {
+        throw new Error("No video track available");
+      }
+
+      // Stop previous stream if exists
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+
+      mediaStreamRef.current = stream;
+      setCurrentDeviceId(videoTrack.getSettings().deviceId);
+      setStreamActive(true);
+      setCameraDisconnected(false);
+
+      // Setup video element with retries
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await new Promise((resolve) => {
+          const onLoaded = () => {
+            if (videoRef.current.readyState >= 2) { // HAVE_ENOUGH_DATA
+              videoRef.current.play().then(resolve).catch(() => {
+                // Retry play if failed
+                setTimeout(() => {
+                  videoRef.current.play().then(resolve).catch(resolve);
+                }, 500);
+              });
+            } else {
+              videoRef.current.addEventListener('canplay', () => {
+                videoRef.current.play().then(resolve).catch(resolve);
+              }, { once: true });
+            }
+          };
+
+          if (videoRef.current.readyState >= 1) { // HAVE_METADATA
+            onLoaded();
+          } else {
+            videoRef.current.onloadedmetadata = onLoaded;
+          }
+        });
+      }
+
+      // Monitor for track ending
+      videoTrack.addEventListener('ended', () => {
+        setCameraDisconnected(true);
+        setStreamActive(false);
+        toast.error("Camera disconnected! Trying to reconnect...");
+        initializeCamera(currentDeviceId).catch(() => {
+          // If reconnecting with same device fails, try any available camera
+          initializeCamera().catch(console.error);
+        });
+      });
+
+      return true;
+    } catch (error) {
+      console.error("Camera initialization failed:", error);
+      setMediaError(error.message);
+      setCameraDisconnected(true);
+      setStreamActive(false);
+      
+      // Try again without device constraints if specific device failed
+      if (deviceId && error.name === 'OverconstrainedError') {
+        return initializeCamera();
+      }
+      
+      return false;
     }
-  }, [submitted, hasMediaPermissions, monitorStream]);
+  }, [currentDeviceId]);
+
+  // Frame monitoring for black screen detection
+  const startFrameMonitoring = useCallback(() => {
+    if (frameMonitorIntervalRef.current) {
+      clearInterval(frameMonitorIntervalRef.current);
+    }
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    let blankCount = 0;
+
+    frameMonitorIntervalRef.current = setInterval(() => {
+      if (!videoRef.current || videoRef.current.videoWidth === 0) return;
+
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      ctx.drawImage(videoRef.current, 0, 0);
+
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const pixelValues = imageData.data;
+      let totalLuminance = 0;
+
+      // Calculate frame luminance
+      for (let i = 0; i < pixelValues.length; i += 4) {
+        totalLuminance += 0.299 * pixelValues[i] + 
+                         0.587 * pixelValues[i+1] + 
+                         0.114 * pixelValues[i+2];
+      }
+
+      const avgLuminance = totalLuminance / (pixelValues.length / 4);
+      
+      // Detect black frames (luminance < 10)
+      if (avgLuminance < 10) {
+        blankCount++;
+        if (blankCount > 5) {
+          toast.warn("Camera feed lost - attempting to reconnect...");
+          initializeCamera(currentDeviceId);
+          blankCount = 0;
+        }
+      } else {
+        blankCount = 0;
+      }
+    }, 1000);
+  }, [initializeCamera, currentDeviceId]);
+
+  // Robust fullscreen handling with auto-submit after 3 warnings
+  const enterFullscreen = useCallback(async () => {
+    if (fullscreenRetryTimeoutRef.current) {
+      clearTimeout(fullscreenRetryTimeoutRef.current);
+    }
+
+    try {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+        setIsFullscreen(true);
+        setShowFullscreenWarning(false);
+        toast.dismiss('fullscreen-warning');
+      }
+    } catch (error) {
+      console.warn("Fullscreen error:", error);
+      // Retry after delay if failed
+      fullscreenRetryTimeoutRef.current = setTimeout(() => {
+        enterFullscreen();
+      }, 500);
+    }
+  }, []);
+
+  // Fullscreen enforcement with auto-submit
+  useEffect(() => {
+    if (!submitted) return;
+
+    const handleFullscreenChange = () => {
+      const isCurrentlyFullscreen = !!document.fullscreenElement;
+      setIsFullscreen(isCurrentlyFullscreen);
+
+      if (!isCurrentlyFullscreen) {
+        fullscreenExitCountRef.current += 1;
+        const exitCount = fullscreenExitCountRef.current;
+        
+        setShowFullscreenWarning(true);
+        
+        if (exitCount <= 3) {
+          toast.warn(
+            `Warning ${exitCount}/3: Fullscreen exit detected! ${
+              3 - exitCount > 0 
+                ? `${3 - exitCount} more warning${3 - exitCount > 1 ? 's' : ''} before auto-submit.` 
+                : 'Test will be auto-submitted!'
+            }`,
+            { autoClose: false, toastId: 'fullscreen-warning' }
+          );
+
+          // Aggressive fullscreen re-entry
+          enterFullscreen();
+        }
+
+        if (exitCount >= 3) {
+          handleAutoSubmit();
+          toast.error('Test auto-submitted due to multiple fullscreen exits!');
+        }
+      }
+    };
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      if (fullscreenRetryTimeoutRef.current) {
+        clearTimeout(fullscreenRetryTimeoutRef.current);
+      }
+    };
+  }, [submitted, enterFullscreen]);
+
+  // Camera monitoring and permission handling
+  useEffect(() => {
+    if (!submitted || !hasMediaPermissions) return;
+
+    const monitorStream = async () => {
+      if (!mediaStreamRef.current) return;
+
+      const videoTracks = mediaStreamRef.current.getVideoTracks();
+      if (videoTracks.length === 0) {
+        setCameraDisconnected(true);
+        setStreamActive(false);
+        return;
+      }
+
+      const isActive = videoTracks[0].readyState === 'live';
+      setStreamActive(isActive);
+      setCameraDisconnected(!isActive);
+
+      if (!isActive) {
+        toast.error("Camera disconnected! Attempting to reconnect...", {
+          autoClose: false,
+          toastId: 'camera-error'
+        });
+        try {
+          await initializeCamera(currentDeviceId);
+        } catch (error) {
+          console.error("Camera reconnection failed:", error);
+        }
+      } else {
+        toast.dismiss('camera-error');
+      }
+    };
+
+    checkStreamIntervalRef.current = setInterval(monitorStream, 3000);
+    return () => {
+      clearInterval(checkStreamIntervalRef.current);
+      toast.dismiss('camera-error');
+    };
+  }, [submitted, hasMediaPermissions, initializeCamera, currentDeviceId]);
 
   // Load test data
   useEffect(() => {
@@ -80,7 +337,6 @@ export default function TestForm() {
           setTest(testData);
           setTimeLeft(testData.duration * 60);
           
-          // Initialize answers
           setAnswers(testData.questions.map(question => 
             question.type === 'multiple' ? [] : ''
           ));
@@ -118,135 +374,46 @@ export default function TestForm() {
     return () => clearInterval(timer);
   }, [timeLeft, submitted]);
 
-  // Request media permissions with enhanced error handling
-  const requestMediaPermissions = useCallback(async () => {
-    try {
-      setMediaError(null);
-      
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("Media devices API not supported");
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'user',
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        },
-        audio: true
-      });
-
-      const videoTracks = stream.getVideoTracks();
-      if (videoTracks.length === 0) {
-        throw new Error("No video track available");
-      }
-
-      mediaStreamRef.current = stream;
-      setStreamActive(true);
-      
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await new Promise((resolve) => {
-          videoRef.current.onloadedmetadata = () => {
-            videoRef.current.play()
-              .then(resolve)
-              .catch(e => {
-                console.warn("Video play warning:", e);
-                resolve();
-              });
-          };
-        });
-      }
-
-      setHasMediaPermissions(true);
-      await enterFullscreen();
-      
-    } catch (error) {
-      console.error("Media error:", error);
-      setMediaError(error.message);
-      toast.error(`Proctoring error: ${error.message}`);
-      setHasMediaPermissions(false);
-      
-      // Still allow test to proceed but mark as no permissions
-      setSubmitted(true);
-    }
-  }, []);
-
-  // Enhanced fullscreen handling
-  const enterFullscreen = useCallback(async () => {
-    try {
-      if (!document.fullscreenElement) {
-        await document.documentElement.requestFullscreen();
-        setIsFullscreen(true);
-      }
-    } catch (error) {
-      console.warn("Fullscreen error:", error);
-      toast.warn("Could not enter fullscreen automatically. Please press F11 to enter fullscreen.");
-    }
-  }, []);
-
-  // Clean up resources
+  // Clean up all resources
   useEffect(() => {
     return () => {
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach(track => track.stop());
       }
-      if (document.fullscreenElement) {
-        document.exitFullscreen().catch(console.warn);
+      if (frameMonitorIntervalRef.current) {
+        clearInterval(frameMonitorIntervalRef.current);
       }
-      clearInterval(checkStreamIntervalRef.current);
+      if (checkStreamIntervalRef.current) {
+        clearInterval(checkStreamIntervalRef.current);
+      }
+      if (fullscreenRetryTimeoutRef.current) {
+        clearTimeout(fullscreenRetryTimeoutRef.current);
+      }
       toast.dismiss();
     };
   }, []);
 
-  // Robust fullscreen monitoring
-  useEffect(() => {
-    if (!submitted) return;
-
-    const handleFullscreenChange = () => {
-      const isCurrentlyFullscreen = !!document.fullscreenElement;
-      setIsFullscreen(isCurrentlyFullscreen);
-
-      if (!isCurrentlyFullscreen) {
-        fullscreenExitCountRef.current += 1;
-        const exitCount = fullscreenExitCountRef.current;
-        const remainingWarnings = 3 - exitCount;
-        
-        setShowFullscreenWarning(true);
-        
-        if (exitCount <= 3) {
-          toast.warn(
-            `Warning ${exitCount}/3: Fullscreen exit detected! ${
-              remainingWarnings > 0 
-                ? `${remainingWarnings} more warning${remainingWarnings > 1 ? 's' : ''} before auto-submit.` 
-                : 'Test will be auto-submitted!'
-            }`,
-            { autoClose: false, toastId: 'fullscreen-warning' }
-          );
-        }
-
-        if (exitCount >= 3) {
-          handleAutoSubmit();
-          toast.error('Test auto-submitted due to multiple fullscreen exits!');
-        } else {
-          // Aggressive fullscreen re-entry
-          setTimeout(() => {
-            if (!document.fullscreenElement) {
-              enterFullscreen().catch(console.warn);
-            }
-          }, 500);
-        }
+  // Request media permissions
+  const requestMediaPermissions = useCallback(async () => {
+    try {
+      setMediaError(null);
+      await getVideoDevices();
+      const success = await initializeCamera();
+      
+      if (success) {
+        setHasMediaPermissions(true);
+        startFrameMonitoring();
+        await enterFullscreen();
       } else {
-        setShowFullscreenWarning(false);
-        toast.dismiss('fullscreen-warning');
+        throw new Error("Could not initialize camera");
       }
-    };
-
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFullscreenChange);
-    };
-  }, [submitted, enterFullscreen]);
+    } catch (error) {
+      console.error("Media permission error:", error);
+      toast.error(`Proctoring error: ${error.message}`);
+      setHasMediaPermissions(false);
+      setSubmitted(true); // Allow test to continue without camera
+    }
+  }, [initializeCamera, startFrameMonitoring, enterFullscreen, getVideoDevices]);
 
   const handleAutoSubmit = async () => {
     if (isSubmitting) return;
@@ -355,7 +522,6 @@ export default function TestForm() {
           question.correctAnswer.every(ans => userSet.has(ans))
           ? score + 1 : score);
       }
-      
       return score;
     }, 0);
   };
@@ -459,7 +625,7 @@ export default function TestForm() {
 
   return (
     <div className="relative">
-      {/* Webcam preview with enhanced status display */}
+      {/* Webcam preview with enhanced reliability */}
       {hasMediaPermissions && (
         <div className="fixed bottom-4 right-4 z-50 w-48 h-36 bg-black rounded-lg overflow-hidden shadow-xl border-2 border-red-500">
           <video
@@ -467,6 +633,8 @@ export default function TestForm() {
             autoPlay
             muted
             playsInline
+            disablePictureInPicture
+            disableRemotePlayback
             className="w-full h-full object-cover"
             style={{ transform: 'rotateY(180deg)' }}
           />
@@ -481,7 +649,7 @@ export default function TestForm() {
         </div>
       )}
       
-      {/* Enhanced fullscreen warning modal */}
+      {/* Fullscreen enforcement modal */}
       {showFullscreenWarning && (
         <div className="fixed inset-0 bg-black bg-opacity-90 z-50 flex flex-col items-center justify-center text-white p-6">
           <div className="bg-red-600 text-white p-6 rounded-lg max-w-md text-center">

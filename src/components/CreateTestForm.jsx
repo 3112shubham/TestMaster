@@ -16,7 +16,21 @@ export default function CreateTestForm({ onTestCreated }) {
   });
   const [activeTab, setActiveTab] = useState('details');
 
-  const batchOptions = ['Batch 1', 'Batch 2', 'Batch 3', 'Weekend Batch'];
+  const batchOptions = ['Tapasya Campus T1','Tapasya Campus T2','Tapasya Campus T3','Tapasya Campus T4'
+,'Tapasya Campus T5'
+,'Dhruv Campus D1'
+,'Dhruv Campus D2'
+,'Dhruv Campus D3'
+,'Dhruv Campus D4'
+,'Abhinavan Campus A8'
+,'Abhinavan Campus A9'
+,'Abhinavan Campus A1'
+,'Abhinavan Campus A2'
+,'Abhinavan Campus A3'
+,'Abhinavan Campus A4'
+,'Abhinavan Campus A5'
+,'Abhinavan Campus A6'
+,'Abhinavan Campus A7'];
 
   const handleAddQuestion = () => {
     if (!currentQuestion.text) {
