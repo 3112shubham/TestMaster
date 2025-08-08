@@ -30,7 +30,23 @@ export default function CreateTestForm({ onTestCreated }) {
 ,'Abhinavan Campus A4'
 ,'Abhinavan Campus A5'
 ,'Abhinavan Campus A6'
-,'Abhinavan Campus A7'];
+,'Abhinavan Campus A7'
+,'IIMP FB 1'
+,'IIMP FB 2'
+,'IIMP MB 1'
+,'IIMP MB 2'
+,'ISBS-MBA FB 3'
+,'ISBS-MBA FB 4'
+,'ISBS-MBA MB 3'
+,'ISBS-MBA MB 4'
+,'ISBS-PGDM MB 5'
+,'ISBS-PGDM MB 6'
+,'ISBS-PGDM MB 7'
+,'ISBS-PGDM MB 8'
+,'ISBS-PGDM FB 5'
+,'ISBS-PGDM FB 6'
+
+];
 
   const handleAddQuestion = () => {
     if (!currentQuestion.text) {
